@@ -4,16 +4,17 @@ package main
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"github.com/pg9182/tf2vpk"
-	"github.com/pg9182/tf2vpk/cmd/internal"
+	"github.com/pg9182/tf2vpk/internal"
+	"github.com/pg9182/tf2vpk/vpkutil"
 	"github.com/spf13/pflag"
 )
 
@@ -24,9 +25,7 @@ var (
 	DryRun    = pflag.BoolP("dry-run", "n", false, "Don't write output files")
 
 	Merge          = pflag.Bool("merge", false, "Merges all blocks (i.e., _XXX.vpk)")
-	Exclude        = pflag.StringSlice("exclude", nil, "Excludes files or directories matching the provided glob (anchor to the start with /)")
-	ExcludeBSPLump = pflag.IntSlice("exclude-bsp-lump", nil, "Shortcut for --exclude to remove %04x.bsp_lump")
-	Include        = pflag.StringSlice("include", nil, "Negates --exclude for files or directories matching the provided glob")
+	IncludeExclude = vpkutil.NewCLIIncludeExclude(pflag.CommandLine)
 
 	Help = pflag.BoolP("help", "h", false, "Show this help message")
 )
@@ -67,6 +66,11 @@ func main() {
 		inputDir = x
 	}
 
+	if err := os.Mkdir(*Output, 0777); err != nil && !errors.Is(err, fs.ErrExist) {
+		fmt.Fprintf(os.Stderr, "error: failed to create output directory: %v\n", err)
+		os.Exit(1)
+	}
+
 	var outputDir string
 	if x, err := filepath.EvalSymlinks(*Output); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to resolve output path: %v\n", err)
@@ -92,14 +96,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: find vpks: %v\n", err)
 		}
 		for _, e := range es {
-			if !strings.HasPrefix(e.Name(), *VPKPrefix) {
+			name, idx, err := tf2vpk.SplitName(e.Name(), *VPKPrefix)
+			if err != nil {
 				continue
 			}
-			if !strings.HasSuffix(e.Name(), tf2vpk.ValvePakDirSuffix) {
+			if idx != tf2vpk.ValvePakIndexDir {
 				continue
 			}
 			vlog(VVerbose, "found %s", filepath.Join(inputDir, e.Name()))
-			vpkName = append(vpkName, strings.TrimSuffix(strings.TrimPrefix(e.Name(), *VPKPrefix), tf2vpk.ValvePakDirSuffix))
+			vpkName = append(vpkName, name)
 		}
 	} else {
 		vpkName = argv[1:]
@@ -127,14 +132,16 @@ func main() {
 func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 	vlog(VStatus, "optimizing %s", filepath.Base(vpkName))
 
-	r, err := tf2vpk.OpenReader(inputDir, *VPKPrefix, vpkName)
+	vpk := tf2vpk.ValvePakRef{Path: inputDir, Prefix: *VPKPrefix, Name: vpkName}
+
+	r, err := tf2vpk.NewReader(vpk)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
 	var origBlockBytesTotal uint64
-	origBlockBytes := map[uint16]uint64{}
+	origBlockBytes := map[tf2vpk.ValvePakIndex]uint64{}
 	for _, f := range r.Root.File {
 		for _, c := range f.Chunk {
 			if x := c.Offset + c.CompressedSize; x > origBlockBytes[f.Index] {
@@ -149,7 +156,7 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 	// TODO: use interval/segment trees to make this more efficient (time, space, and the resulting size)
 
 	type CID struct {
-		BlockIndex  uint16
+		BlockIndex  tf2vpk.ValvePakIndex
 		ChunkOffset uint64
 		ChunkSize   uint64
 	}
@@ -169,32 +176,9 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 	var nf []tf2vpk.ValvePakFile
 	var nfd int
 	for _, f := range r.Root.File {
-		var excluded bool
-		for _, x := range *Exclude {
-			if m, err := internal.MatchGlobParents(x, f.Path); err != nil {
-				return fmt.Errorf("process excludes: match %q against glob %q: %w", f.Path, x, err)
-			} else if m {
-				vlog(VDebug, "--- exclude %q: matched %q", x, f.Path)
-				excluded = true
-			}
-		}
-		for _, x := range *ExcludeBSPLump {
-			if m, err := internal.MatchGlobParents(fmt.Sprintf("%04x.bsp_lump", x), f.Path); err != nil {
-				return fmt.Errorf("process bsp lump excludes: match %q against glob %q: %w", f.Path, x, err)
-			} else if m {
-				vlog(VDebug, "--- exclude lump %d: matched %q", x, f.Path)
-				excluded = true
-			}
-		}
-		for _, x := range *Include {
-			if m, err := internal.MatchGlobParents(x, f.Path); err != nil {
-				return fmt.Errorf("process includes: match %q against glob %q: %w", f.Path, x, err)
-			} else if m {
-				excluded = false
-				vlog(VDebug, "--- include %q: matched %q", x, f.Path)
-			}
-		}
-		if excluded {
+		if skip, err := IncludeExclude.Skip(f); err != nil {
+			return err
+		} else if skip {
 			vlog(VVerbose, "--- excluding %s", f.Path)
 			nfd++
 			continue
@@ -204,7 +188,7 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 	vlog(VStatus, "--- excluding %d files", nfd)
 	r.Root.File = nf
 
-	bf := map[uint16]io.Writer{}
+	bf := map[tf2vpk.ValvePakIndex]io.Writer{}
 	if *Merge {
 		tf, err := os.CreateTemp(outputDir, ".vpkblock0")
 		if err != nil {
@@ -229,7 +213,7 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 			if *DryRun {
 				bf[f.Index] = io.Discard
 			} else {
-				tf, err := os.CreateTemp(outputDir, ".vpkblock"+strconv.Itoa(int(f.Index))+"-*")
+				tf, err := os.CreateTemp(outputDir, ".vpkblock"+f.Index.String()+"-*")
 				if err != nil {
 					return fmt.Errorf("create temp file for vpk block %d: %w", f.Index, err)
 				}
@@ -246,8 +230,8 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 		vlog(VStatus, "--- writing %d block(s)", len(bf))
 	}
 
-	bfc := make(map[uint16]uint64, len(bf))              // current offset
-	bfw := make(map[uint16]map[[20]byte]uint64, len(bf)) // written chunk offset
+	bfc := make(map[tf2vpk.ValvePakIndex]uint64, len(bf))              // current offset
+	bfw := make(map[tf2vpk.ValvePakIndex]map[[20]byte]uint64, len(bf)) // written chunk offset
 
 	for x := range bf {
 		bfc[x] = 0
@@ -257,11 +241,14 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 	var cc int
 	var ccb int64
 	for i, f := range r.Root.File {
-		var targetIndex uint16
+		var targetIndex tf2vpk.ValvePakIndex
 		if *Merge {
 			targetIndex = 0
 		} else {
 			targetIndex = f.Index
+		}
+		if targetIndex == tf2vpk.ValvePakIndexDir {
+			panic("tf2-vpkoptim: writing chunks after index dir not implemented yet")
 		}
 		for j, c := range f.Chunk {
 			select {
@@ -356,16 +343,16 @@ func optimize(ctx context.Context, inputDir, outputDir, vpkName string) error {
 		default:
 		}
 
-		if err := os.Rename(df.Name(), filepath.Join(outputDir, tf2vpk.ValvePakDirName(*VPKPrefix, vpkName))); err != nil {
+		if err := os.Rename(df.Name(), filepath.Join(outputDir, tf2vpk.JoinName(*VPKPrefix, vpkName, tf2vpk.ValvePakIndexDir))); err != nil {
 			return fmt.Errorf("rename final vpk dir: %w", err)
 		}
-		vlog(VDebug, "saved vpk dir %s", tf2vpk.ValvePakDirName(*VPKPrefix, vpkName))
+		vlog(VDebug, "saved vpk dir %s", tf2vpk.JoinName(*VPKPrefix, vpkName, tf2vpk.ValvePakIndexDir))
 
 		for n, x := range bf {
-			if err := os.Rename(x.(*os.File).Name(), filepath.Join(outputDir, tf2vpk.ValvePakBlockName(vpkName, n))); err != nil {
+			if err := os.Rename(x.(*os.File).Name(), filepath.Join(outputDir, tf2vpk.JoinName(*VPKPrefix, vpkName, n))); err != nil {
 				return fmt.Errorf("rename final vpk block: %w", err)
 			}
-			vlog(VDebug, "saved vpk block %s", tf2vpk.ValvePakBlockName(vpkName, n))
+			vlog(VDebug, "saved vpk block %s", tf2vpk.JoinName(*VPKPrefix, vpkName, n))
 		}
 	}
 

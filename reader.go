@@ -1,12 +1,12 @@
 package tf2vpk
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,52 +14,63 @@ import (
 
 // Reader reads Titanfall 2 VPKs.
 type Reader struct {
-	Root ValvePakDir
-	data map[uint16]interface {
-		io.ReaderAt
-		io.Closer
-	}
+	Root  ValvePakDir
+	block map[ValvePakIndex]io.ReaderAt
+	close map[ValvePakIndex]io.Closer
 }
 
-// OpenReader opens the Titanfall 2 VPK in path with the provided name and root directory prefix.
-func OpenReader(path, prefix, name string) (*Reader, error) {
-	f, err := os.Open(filepath.Join(path, ValvePakDirName(prefix, name)))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	return NewReader(f, func(i uint16) (interface {
-		io.ReaderAt
-		io.Closer
-	}, error) {
-		return os.Open(filepath.Join(path, ValvePakBlockName(name, i)))
+// NewReader creates a new Reader reading from vpk.
+func NewReader(vpk ValvePakRef) (*Reader, error) {
+	return NewReaderFunc(func(i ValvePakIndex) (io.ReaderAt, error) {
+		return os.Open(vpk.Resolve(i))
 	})
 }
 
-// NewReader creates a new Reader reading the root directory from dir, and opening the packed chunks from the provided
-// function.
-func NewReader(dir io.Reader, data func(uint16) (interface {
-	io.ReaderAt
-	io.Closer
-}, error)) (*Reader, error) {
+// NewReaderFunc creates a new Reader reading using the provided function. If
+// the returned [io.ReaderAt] implements [io.Closer], it will be called when the
+// Reader is closed.
+func NewReaderFunc(open func(ValvePakIndex) (io.ReaderAt, error)) (*Reader, error) {
 	r := &Reader{
-		data: map[uint16]interface {
-			io.ReaderAt
-			io.Closer
-		}{},
+		block: map[ValvePakIndex]io.ReaderAt{},
+		close: map[ValvePakIndex]io.Closer{},
 	}
-	if err := r.Root.Deserialize(dir); err != nil {
+
+	// read dir index
+	dir, err := open(ValvePakIndexDir)
+	if err != nil {
+		return nil, fmt.Errorf("open vpk dir index: %w", err)
+	}
+	if err := r.Root.Deserialize(io.NewSectionReader(dir, 0, 1<<63-1)); err != nil {
 		return nil, fmt.Errorf("read root directory: %w", err)
 	}
+
+	// add dir block
+	chunkOffset, err := r.Root.ChunkOffset()
+	if err != nil {
+		return nil, fmt.Errorf("get chunk offset from root directory: %w", err)
+	}
+	if dir, ok := dir.(io.Closer); ok {
+		r.close[ValvePakIndexDir] = dir
+	}
+	r.block[ValvePakIndexDir] = io.NewSectionReader(dir, int64(chunkOffset), 1<<63-1)
+
+	// open blocks
+	var errs []error
 	for _, b := range r.Root.File {
-		if _, ok := r.data[b.Index]; !ok {
-			if x, err := data(b.Index); err != nil {
-				return nil, fmt.Errorf("open raw data reader for index %d: %w", b.Index, err)
+		if _, ok := r.block[b.Index]; !ok {
+			if x, err := open(b.Index); err != nil {
+				errs = append(errs, fmt.Errorf("open vpk block %s: %w", b.Index, err))
 			} else {
-				r.data[b.Index] = x
+				if x, ok := x.(io.Closer); ok {
+					r.close[b.Index] = x
+				}
+				r.block[b.Index] = x
 			}
 		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		_ = r.Close()
+		return nil, fmt.Errorf("open blocks: %w", err)
 	}
 	return r, nil
 }
@@ -67,38 +78,45 @@ func NewReader(dir io.Reader, data func(uint16) (interface {
 // Close cleans files opened by the Reader.
 func (r *Reader) Close() error {
 	var errs []error
-	if r.data != nil {
-		for i, x := range r.data {
+	if r.close != nil {
+		for i, x := range r.close {
 			if err := x.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close data reader for index %d: %w", i, err))
 			}
 		}
 	}
-	switch len(errs) {
-	case 0:
-		return nil
-	case 1:
-		return errs[0]
-	default:
-		return fmt.Errorf("close data readers: %q", errs)
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("close data readers: %w", err)
 	}
+	return nil
 }
 
 // OpenFile returns a new reader reading the contents of a specific file. The checksum is verified at EOF.
 func (r *Reader) OpenFile(f ValvePakFile) (io.Reader, error) {
-	return f.CreateReader(r.data[f.Index])
+	return f.CreateReader(r.block[f.Index])
 }
 
-// OpenChunkRaw returns a new reader reading the contents of a specific chunk.
+// OpenFileParallel is like OpenFile, but but decompresses chunks in parallel
+// using n goroutines going no more than n compressed chunks ahead.
+func (r *Reader) OpenFileParallel(f ValvePakFile, n int) (io.Reader, error) {
+	return f.CreateReaderParallel(r.block[f.Index], n)
+}
+
+// OpenChunk returns a new reader reading the contents of a specific chunk.
+func (r *Reader) OpenChunk(f ValvePakFile, c ValvePakChunk) (io.Reader, error) {
+	return c.CreateReader(r.block[f.Index])
+}
+
+// OpenChunkRaw returns a new reader reading the raw contents of a specific chunk.
 func (r *Reader) OpenChunkRaw(f ValvePakFile, c ValvePakChunk) (io.Reader, error) {
-	return c.CreateReaderRaw(r.data[f.Index])
+	return c.CreateReaderRaw(r.block[f.Index])
 }
 
 // OpenBlockRaw opens a new reader reading the contents of a specific block.
-func (r *Reader) OpenBlockRaw(n uint16) (io.ReaderAt, error) {
-	x, ok := r.data[n]
+func (r *Reader) OpenBlockRaw(n ValvePakIndex) (io.ReaderAt, error) {
+	x, ok := r.block[n]
 	if !ok {
-		return nil, fmt.Errorf("block %d out of range", n)
+		return nil, fmt.Errorf("block %#v out of range", n)
 	}
 	return x, nil
 }
@@ -216,9 +234,7 @@ func (r *Reader) Open(name string) (fs.File, error) {
 	if !fs.ValidPath(name) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
 	}
-	if strings.HasPrefix(name, "./") {
-		name = name[2:]
-	}
+	name = strings.TrimPrefix(name, "./")
 	for fi, f := range r.Root.File {
 		if f.Path == name {
 			if rc, err := r.OpenFile(f); err != nil {
